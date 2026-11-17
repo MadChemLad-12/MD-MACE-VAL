@@ -33,6 +33,25 @@ Atom groups (assigned from the FIRST frame, held fixed by index)
   Hw / Hs / Hc       H bonded to Ow / to Os / to neither (e.g. C-H)
 RDF pairs are written as "A-B", e.g. Pt-Ow,Ow-Ow,Pt-Os.
 
+Region-resolved RDFs (interfacial layers instead of cell averages)
+  A pair may carry an @region suffix restricting the CENTRE atoms (A):
+    Ow-Ow@near=Pt:3.5   centres = Ow within 3.5 A of any Pt (water at the Pt surface)
+    Ow-Ow@near=C:3.5    centres = Ow within 3.5 A of any C  (water at graphene)
+    Ow-Ow@z=10:14       centres = Ow with wrapped z in [10, 14) A
+  g(r) is still normalised with the mean cell density of B (so heights are not bulk-like);
+  n(r) is the number of B neighbours per selected centre and is unambiguous.
+  Example: --rdf-pairs Pt-Ow,Ow-Ow,Ow-Ow@near=Pt:3.5,Ow-Ow@near=C:3.5
+
+Uncertainties
+  RDFs are accumulated in blocks of --rdf-block-frames samples (run: default 500 samples =
+  500 x --rdf-interval steps; rdf: --rdf-nblocks blocks, default 5). The standard error across
+  blocks is written as gerr_A-B / nerr_A-B columns (needs >= 2 blocks). Blocks must be longer
+  than the correlation time of the quantity, otherwise the error is underestimated.
+
+NVE
+  In --ensemble nve the production-phase total-energy drift (linear fit, meV/atom/ps) is
+  logged and stored in summary.json as nve_drift_meV_per_atom_ps.
+
 Note on slab RDFs: g(r) is normalised with the mean cell volume, which
 includes vacuum. Absolute g(r) heights are therefore not bulk-like. Compare
 MLIP vs AIMD (same cell) rather than to bulk. The cumulative coordination
@@ -95,10 +114,43 @@ def build_groups(atoms):
             "Ow": Ow, "Os": Os, "Hw": Hw & ~Hs, "Hs": Hs, "Hc": Hc}
 
 
+def pair_label(p):
+    a, b, reg = p
+    if reg is None:
+        return f"{a}-{b}"
+    if reg[0] == "near":
+        return f"{a}-{b}@near={reg[1]}:{reg[2]:g}"
+    return f"{a}-{b}@z={reg[1]:g}:{reg[2]:g}"
+
+
+def _parse_pair(tok, groups):
+    reg = None
+    if "@" in tok:
+        tok, rs = tok.split("@", 1)
+        try:
+            if rs.startswith("near="):
+                g, rc = rs[5:].split(":")
+                reg = ("near", g, float(rc))
+                if g not in groups:
+                    raise SystemExit(f"Unknown group '{g}' in region '@{rs}'. Groups: {list(groups)}")
+            elif rs.startswith("z="):
+                lo, hi = rs[2:].split(":")
+                reg = ("z", float(lo), float(hi))
+            else:
+                raise ValueError
+        except ValueError:
+            raise SystemExit(f"Bad region '@{rs}'. Use @near=GROUP:RADIUS or @z=ZLO:ZHI")
+    a, b = tok.split("-")
+    for g in (a, b):
+        if g not in groups:
+            raise SystemExit(f"Unknown group '{g}' in pair '{tok}'. Groups: {list(groups)}")
+    return (a, b, reg)
+
+
 def parse_pairs(s, groups):
-    """Parse "A-B,C-D". With the default pair list, pairs involving groups that do not
-    exist in this system are dropped, and C-C is added if carbon is present
-    (graphene-only systems would otherwise have no RDF at all)."""
+    """Parse "A-B,C-D@near=Pt:3.5". With the default pair list, pairs involving groups that do
+    not exist in this system are dropped, and C-C is added if carbon is present (graphene-only
+    systems would otherwise have no RDF at all). Returns a list of (A, B, region) tuples."""
     if s == DEFAULT_PAIRS:
         keep = [t for t in s.split(",") if all(groups[g].any() for g in t.split("-"))]
         if groups["C"].any():
@@ -109,13 +161,8 @@ def parse_pairs(s, groups):
     pairs = []
     for tok in s.split(","):
         tok = tok.strip()
-        if not tok:
-            continue
-        a, b = tok.split("-")
-        for g in (a, b):
-            if g not in groups:
-                raise SystemExit(f"Unknown group '{g}' in pair '{tok}'. Groups: {list(groups)}")
-        pairs.append((a, b))
+        if tok:
+            pairs.append(_parse_pair(tok, groups))
     return pairs
 
 
@@ -123,20 +170,68 @@ def parse_pairs(s, groups):
 # RDF and z-profile accumulators
 # --------------------------------------------------------------------------
 class RDFAccumulator:
-    def __init__(self, groups, pairs, rmax=8.0, dr=0.02):
+    """Pair RDFs accumulated in blocks (for block-averaged standard errors) and optionally
+    restricted to centre atoms in a region (see module docstring)."""
+
+    def __init__(self, groups, pairs, rmax=8.0, dr=0.02, block_frames=0):
         self.groups, self.pairs, self.rmax = groups, pairs, rmax
+        self.labels = [pair_label(p) for p in pairs]
         self.edges = np.arange(0.0, rmax + 0.5 * dr, dr)
-        self.hist = {p: np.zeros(len(self.edges) - 1) for p in pairs}
+        self.block_frames = int(block_frames)  # 0 -> one block, no error bars
+        self.blocks = []
+        self.cur = None
+        self._new_block()
         self.nframes = 0
-        self.vol = 0.0
+
+    def _new_block(self):
+        self.cur = dict(n=0, vol=0.0,
+                        h={l: np.zeros(len(self.edges) - 1) for l in self.labels},
+                        sel={l: 0.0 for l in self.labels})
+        self.blocks.append(self.cur)
+
+    def _centres(self, atoms, a, reg, i, j, d):
+        m = self.groups[a]
+        if reg[0] == "z":
+            z = atoms.get_positions(wrap=True)[:, 2]
+            return m & (z >= reg[1]) & (z < reg[2])
+        G, rc = self.groups[reg[1]], reg[2]
+        if rc > self.rmax:
+            i, j, d = neighbor_list("ijd", atoms, rc)
+        close = np.zeros(len(atoms), bool)
+        sel = G[j] & m[i] & (d < rc)
+        close[i[sel]] = True
+        return close
 
     def add(self, atoms):
+        if self.block_frames > 0 and self.cur["n"] >= self.block_frames:
+            self._new_block()
         i, j, d = neighbor_list("ijd", atoms, self.rmax)
-        for (a, b) in self.pairs:
-            sel = self.groups[a][i] & self.groups[b][j]
-            self.hist[(a, b)] += np.histogram(d[sel], bins=self.edges)[0]
+        for p, lab in zip(self.pairs, self.labels):
+            a, b, reg = p
+            if reg is None:
+                mi, ncent = self.groups[a][i], int(self.groups[a].sum())
+            else:
+                cm = self._centres(atoms, a, reg, i, j, d)
+                mi, ncent = cm[i], int(cm.sum())
+            sel = mi & self.groups[b][j]
+            self.cur["h"][lab] += np.histogram(d[sel], bins=self.edges)[0]
+            self.cur["sel"][lab] += ncent
+        self.cur["n"] += 1
+        self.cur["vol"] += atoms.get_volume()
         self.nframes += 1
-        self.vol += atoms.get_volume()
+
+    def _gn(self, p, lab, blocks, shell):
+        a, b, _ = p
+        nf = sum(bl["n"] for bl in blocks)
+        V = sum(bl["vol"] for bl in blocks) / max(nf, 1)
+        h = sum(bl["h"][lab] for bl in blocks)
+        sel = sum(bl["sel"][lab] for bl in blocks)
+        Nb = int(self.groups[b].sum())
+        nb = Nb - 1 if a == b else Nb
+        if sel <= 0 or nb <= 0 or nf == 0:
+            nan = np.full(len(shell), np.nan)
+            return nan, nan.copy(), sel / max(nf, 1), V
+        return h / (sel * (nb / V) * shell), np.cumsum(h) / sel, sel / nf, V
 
     def write(self, path):
         if self.nframes == 0:
@@ -144,23 +239,36 @@ class RDFAccumulator:
         e = self.edges
         r = 0.5 * (e[1:] + e[:-1])
         shell = 4.0 * np.pi / 3.0 * (e[1:] ** 3 - e[:-1] ** 3)
-        V = self.vol / self.nframes
-        cols, names = [r], ["r"]
-        info = []
-        for (a, b), h in self.hist.items():
-            Na, Nb = int(self.groups[a].sum()), int(self.groups[b].sum())
-            nb = Nb - 1 if a == b else Nb
-            if Na == 0 or nb <= 0:
-                g = np.full_like(r, np.nan)
-                cn = np.full_like(r, np.nan)
-            else:
-                g = h / (self.nframes * Na * (nb / V) * shell)
-                cn = np.cumsum(h) / (self.nframes * Na)
+        allb = [bl for bl in self.blocks if bl["n"] > 0]
+        use = allb
+        if self.block_frames > 0:
+            use = [bl for bl in allb if bl["n"] >= 0.5 * self.block_frames]  # drop tiny trailing block
+        have_err = len(use) >= 2
+        cols, names, info = [r], ["r"], []
+        V = None
+        for p, lab in zip(self.pairs, self.labels):
+            g, cn, ncent, V = self._gn(p, lab, allb, shell)
             cols += [g, cn]
-            names += [f"g_{a}-{b}", f"n_{a}-{b}"]
-            info.append(f"{a}-{b}: N_a={Na} N_b={Nb}")
+            names += [f"g_{lab}", f"n_{lab}"]
+            if have_err:
+                gb, nb_ = [], []
+                for bl in use:
+                    gg, cc, _, _ = self._gn(p, lab, [bl], shell)
+                    gb.append(gg)
+                    nb_.append(cc)
+                with np.errstate(all="ignore"):
+                    k = np.sum(np.isfinite(gb), axis=0)
+                    ge = np.where(k >= 2, np.nanstd(gb, axis=0, ddof=1) / np.sqrt(np.maximum(k, 1)), np.nan)
+                    ne = np.where(k >= 2, np.nanstd(nb_, axis=0, ddof=1) / np.sqrt(np.maximum(k, 1)), np.nan)
+                cols += [ge, ne]
+                names += [f"gerr_{lab}", f"nerr_{lab}"]
+            Nb = int(self.groups[p[1]].sum())
+            info.append(f"{lab}: <centres>={ncent:.1f} N_b={Nb}")
+        V = sum(bl["vol"] for bl in allb) / self.nframes
+        err_txt = (f"{len(use)} blocks of ~{self.block_frames or self.nframes} samples; "
+                   "gerr/nerr = standard error over blocks" if have_err else "no error bars (<2 blocks)")
         header = (f"RDF over {self.nframes} frames, mean cell volume {V:.1f} A^3 "
-                  f"(cell-volume normalisation, see script docstring)\n"
+                  f"(cell-volume normalisation, see script docstring); {err_txt}\n"
                   + "; ".join(info) + "\n" + " ".join(names))
         np.savetxt(path, np.column_stack(cols), header=header, fmt="%.6f")
 
@@ -226,11 +334,14 @@ class Diagnostics:
         i, j, d = neighbor_list("ijd", atoms, 3.5)
 
         # generic closest-approach check, relative to covalent radii sum
-        ratio = d / (self.rad[i] + self.rad[j])
-        k = int(np.argmin(ratio))
-        out["dmin_ratio"] = float(ratio[k])
-        out["dmin_pair"] = f"{self.sym[i[k]]}{i[k]}-{self.sym[j[k]]}{j[k]}"
-        out["dmin"] = float(d[k])
+        if len(d):
+            ratio = d / (self.rad[i] + self.rad[j])
+            k = int(np.argmin(ratio))
+            out["dmin_ratio"] = float(ratio[k])
+            out["dmin_pair"] = f"{self.sym[i[k]]}{i[k]}-{self.sym[j[k]]}{j[k]}"
+            out["dmin"] = float(d[k])
+        else:  # no pair within 3.5 A (e.g. atoms flew apart): report as "not close"
+            out["dmin_ratio"], out["dmin_pair"], out["dmin"] = 9.9, "none", 3.5
 
         # covalent skeleton (Nafion backbone/sulfonate + graphene) integrity
         if len(self.bi):
@@ -344,6 +455,7 @@ class Observer:
                                "Pt_maxdisp", "H3O", "OH_minus", "H2O", "Os_prot"])
         self.header_every = 40
         self.nlines = 0
+        self.prod_E = []          # (t_ps, Etot_eV) in the production phase, for the NVE drift fit
 
     def gstep(self):
         return self.step0 + self.dyn.nsteps
@@ -375,6 +487,13 @@ class Observer:
         if s % a.log_interval == 0:
             self.log_state(s)
 
+    def nve_drift(self):
+        """slope of Etot (meV/atom/ps) over the NVE production phase, or None"""
+        if self.args.ensemble != "nve" or len(self.prod_E) < 5:
+            return None
+        t, e = np.array(self.prod_E).T
+        return float(np.polyfit(t, e / self.N * 1000.0, 1)[0])
+
     def write_analysis(self):
         self.rdf.write(self.paths["rdf"])
         self.zprof.write(self.paths["zprof"])
@@ -403,6 +522,8 @@ class Observer:
         if self.e_ref is None:
             self.e_ref = etot
         drift = (etot - self.e_ref) / self.N * 1000.0
+        if self.phase == "prod":
+            self.prod_E.append((t_ps, etot))
 
         elapsed = time.time() - self.t_wall0
         nsday = ((s - self.step_wall0) * self.dt * 1e-6) / (elapsed / 86400.0) if elapsed > 0 else 0.0
@@ -504,7 +625,10 @@ def cmd_run(args):
     log.info("covalent skeleton bonds tracked: %d", len(diag.bi))
 
     pairs = parse_pairs(args.rdf_pairs, groups)
-    rdf = RDFAccumulator(groups, pairs, rmax=args.rdf_rmax, dr=args.rdf_dr)
+    bf = args.rdf_block_frames or 500
+    rdf = RDFAccumulator(groups, pairs, rmax=args.rdf_rmax, dr=args.rdf_dr, block_frames=bf)
+    log.info("RDF pairs: %s | block = %d samples = %.2f ps",
+             [pair_label(p) for p in pairs], bf, bf * args.rdf_interval * args.timestep / 1000.0)
     zprof = ZProfile(groups, atoms.cell[2, 2] if atoms.cell[2, 2] > 0 else 1.0, dz=args.z_dz)
 
     # velocities
@@ -576,10 +700,18 @@ def cmd_run(args):
     obs.csv_file.close()
 
     dg = diag.compute(atoms)
+    nve_drift = obs.nve_drift()
+    if nve_drift is not None:
+        log.info("NVE production total-energy drift: %.4f meV/atom/ps", nve_drift)
+        if abs(nve_drift) > args.nve_drift_warn:
+            log.warning("WARN: NVE drift %.4f meV/atom/ps exceeds --nve-drift-warn (%.3f); "
+                        "check dtype (use float64), timestep and model smoothness",
+                        nve_drift, args.nve_drift_warn)
     summary = dict(status=status, n_atoms=n, final_step=int(obs.gstep()), final_time_ps=obs.gstep() * dt / 1000,
                    wall_s=time.time() - t_start, T_final=float(atoms.get_temperature()),
                    n_broken_final=dg["n_broken"], Pt_isolated_final=dg["Pt_isolated"],
-                   dmin_ratio_min_seen=obs.min_ratio_seen, rdf_frames=rdf.nframes)
+                   dmin_ratio_min_seen=obs.min_ratio_seen, rdf_frames=rdf.nframes,
+                   nve_drift_meV_per_atom_ps=nve_drift)
     with open(paths["summary"], "w") as fh:
         json.dump(summary, fh, indent=2)
     log.info("=" * 100)
@@ -602,7 +734,10 @@ def cmd_rdf(args):
     groups = build_groups(ref)
     log.info("frames: %d | groups: %s", len(frames), {g: int(m.sum()) for g, m in groups.items() if m.any()})
     pairs = parse_pairs(args.rdf_pairs, groups)
-    rdf = RDFAccumulator(groups, pairs, rmax=args.rdf_rmax, dr=args.rdf_dr)
+    bf = args.rdf_block_frames or max(1, -(-len(frames) // max(args.rdf_nblocks, 1)))
+    rdf = RDFAccumulator(groups, pairs, rmax=args.rdf_rmax, dr=args.rdf_dr, block_frames=bf)
+    log.info("RDF pairs: %s | %d blocks of %d frames", [pair_label(p) for p in pairs],
+             -(-len(frames) // bf), bf)
     zprof = ZProfile(groups, ref.cell[2, 2], dz=args.z_dz)
     for fr in frames:
         if len(fr) != len(ref):
@@ -625,6 +760,9 @@ def build_parser():
         q.add_argument("--rdf-rmax", type=float, default=8.0)
         q.add_argument("--rdf-dr", type=float, default=0.02)
         q.add_argument("--z-dz", type=float, default=0.25, help="z-profile bin width (A)")
+        q.add_argument("--rdf-block-frames", type=int, default=0,
+                       help="RDF samples per error-bar block (0 = auto: 500 for run, nframes/--rdf-nblocks for rdf)")
+        q.add_argument("--rdf-nblocks", type=int, default=5, help="rdf sub-command: number of blocks")
 
     r = sub.add_parser("run", help="run MD")
     r.add_argument("--structure", help="extxyz/xyz/POSCAR with cell + pbc")
@@ -661,6 +799,8 @@ def build_parser():
                    help="write a frame to events.extxyz whenever the isolated-Pt count changes")
     r.add_argument("--abort-fmax", type=float, default=50.0, help="abort if max |F| exceeds this (eV/A)")
     r.add_argument("--abort-temp-factor", type=float, default=3.0)
+    r.add_argument("--nve-drift-warn", type=float, default=0.1,
+                   help="warn if |NVE Etot drift| exceeds this (meV/atom/ps); threshold is a rule of thumb")
     add_rdf_args(r)
     r.set_defaults(func=cmd_run)
 
